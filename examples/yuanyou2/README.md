@@ -1,41 +1,55 @@
-# Yuanyou2 OpenPI Checklist
+# Yuanyou2 OpenPI 使用检查清单
 
-This directory contains the ROS1 client and rosbag conversion tools for the Yuanyou2 dual-Piper robot.
+本目录包含 Yuanyou2 双 Piper 轮臂机器人接入 OpenPI 的 ROS1 运行客户端和 rosbag 转 LeRobot 数据集工具。
 
-## Runtime Convention
+## 运行约定
 
-The policy state and action are 14-dimensional:
+当前策略输入状态和输出动作都是 14 维：
 
 ```text
 [left_joint1..left_joint6, left_gripper,
  right_joint1..right_joint6, right_gripper]
 ```
 
-The gripper scalar is `joint7` on each arm. `joint8` is the opposite finger in the URDF and is not commanded separately by this OpenPI interface.
+左右夹爪标量都使用各自的 `joint7`。URDF 中的 `joint8` 是联动的另一侧手指，本 OpenPI 接口不单独控制 `joint8`。
 
-## Before Recording Bags
+三路图像输入约定为：
 
-On the Jetson:
+```text
+observation/images/head
+observation/images/left_wrist
+observation/images/right_wrist
+```
+
+头部相机固定在机器人 TF 树上，不再走手眼标定流程；双腕相机使用已经保存并验证过的 wrist static TF。
+
+## 采集前启动
+
+在 Jetson 上先加载 ROS 环境：
 
 ```bash
 source /opt/ros/noetic/setup.bash
 source ~/yuanyou2_ws/devel/setup.bash
-
-roslaunch yuanyou2 three_cameras.launch
-roslaunch yuanyou2 camera_tf.launch
 ```
 
-Run the preflight check:
+启动三路相机和双腕 TF：
+
+```bash
+roslaunch yuanyou2 three_cameras.launch
+roslaunch yuanyou2 camera_tf.launch publish_head:=false
+```
+
+采集前运行预检查脚本：
 
 ```bash
 python3 examples/yuanyou2/check_ros_setup.py
 ```
 
-Fix any failed camera topic, camera_info topic, `/joint_states`, or clock warning before collecting real data.
+如果脚本提示相机 topic、`camera_info`、`/joint_states` 或系统时间异常，需要先修好再采集正式数据。Jetson 时间如果还停在 1970，会影响 bag 文件时间戳、日志排查和后续数据整理。
 
-## Bag Topics
+## 建议录制的 Bag Topic
 
-Record at least:
+至少录制下面这些 topic：
 
 ```bash
 rosbag record -O yuanyou2_demo.bag \
@@ -52,11 +66,11 @@ rosbag record -O yuanyou2_demo.bag \
   /tf_static
 ```
 
-The converter uses `/left/joint_cmd` and `/right/joint_cmd` as actions when present. If they are missing, it falls back to the next sampled `/joint_states` value.
+转换脚本会优先把 `/left/joint_cmd` 和 `/right/joint_cmd` 作为真实 action。若这两个 command topic 缺失，默认会退回到下一帧 `/joint_states` 近似 action。
 
-## Convert Bags
+## 转换 Bag
 
-Run conversion in a Python environment that can import ROS1 `rosbag` and `cv_bridge`. On the Jetson this usually means sourcing ROS Noetic first; on another machine, use a ROS-aware virtual environment or container.
+转换脚本依赖 ROS1 的 `rosbag` 和 `cv_bridge`。在 Jetson 上转换时通常需要先 source ROS Noetic；如果在训练机上转换，需要使用能 import ROS1 Python 包的虚拟环境或容器。
 
 ```bash
 source /opt/ros/noetic/setup.bash
@@ -66,27 +80,39 @@ uv run examples/yuanyou2/convert_yuanyou2_data_to_lerobot.py /path/to/bag_dir \
   --task "pick a cube and place it on another cube"
 ```
 
-For strict command-action conversion:
+如果希望严格只使用实际 command action，使用：
 
 ```bash
 uv run examples/yuanyou2/convert_yuanyou2_data_to_lerobot.py /path/to/bag_dir \
   --action-source command
 ```
 
-## Train
+如果你的实际 topic 名称和默认值不同，可以通过参数覆盖：
 
-After conversion, compute normalization stats and train:
+```bash
+uv run examples/yuanyou2/convert_yuanyou2_data_to_lerobot.py /path/to/bag_dir \
+  --head-image-topic /your/head/image_raw \
+  --left-wrist-image-topic /your/left_wrist/image_raw \
+  --right-wrist-image-topic /your/right_wrist/image_raw \
+  --joint-state-topic /joint_states \
+  --left-cmd-topic /left/joint_cmd \
+  --right-cmd-topic /right/joint_cmd
+```
+
+## 训练
+
+转换完成后，先计算归一化统计量，再开始训练：
 
 ```bash
 uv run scripts/compute_norm_stats.py pi05_yuanyou2_lora_finetune
 uv run scripts/train.py pi05_yuanyou2_lora_finetune --exp_name first_run
 ```
 
-Update the Yuanyou2 training config repo id to your real LeRobot dataset before this step.
+开始训练前，需要把 Yuanyou2 训练配置里的 `repo_id="your_username/yuanyou2_dataset"` 改成你真实的 LeRobot 数据集名称。
 
-## Serve And Run
+## 部署运行
 
-On the policy server machine:
+在策略服务器机器上启动 policy server：
 
 ```bash
 uv run scripts/serve_policy.py policy:checkpoint \
@@ -94,10 +120,21 @@ uv run scripts/serve_policy.py policy:checkpoint \
   --policy.dir=checkpoints/pi05_yuanyou2_lora_finetune/first_run/20000
 ```
 
-On the Jetson:
+在 Jetson 上启动机器人侧客户端：
 
 ```bash
 python3 examples/yuanyou2/main.py \
   --remote-host <policy-server-ip> \
+  --prompt "pick a cube and place it on another cube"
+```
+
+如果运行时 topic 名称和默认配置不一致，也可以在客户端启动时覆盖：
+
+```bash
+python3 examples/yuanyou2/main.py \
+  --remote-host <policy-server-ip> \
+  --head-image-topic /your/head/image_raw \
+  --left-wrist-image-topic /your/left_wrist/image_raw \
+  --right-wrist-image-topic /your/right_wrist/image_raw \
   --prompt "pick a cube and place it on another cube"
 ```
