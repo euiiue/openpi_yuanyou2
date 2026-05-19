@@ -1,4 +1,4 @@
-# Yuanyou2 OpenPI 使用检查清单
+# Yuanyou2 Pi 0.5部署checklist
 
 本目录包含 Yuanyou2 双 Piper 轮臂机器人接入 OpenPI 的 ROS1 运行客户端和 rosbag 转 LeRobot 数据集工具。
 
