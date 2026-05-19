@@ -10,6 +10,8 @@ Responsibilities:
 4. Publish 14-dim Yuanyou2 action to real robot command topics.
 """
 
+from __future__ import annotations
+
 import logging
 import time
 from threading import Lock
@@ -24,7 +26,11 @@ from sensor_msgs.msg import Image, JointState
 class Yuanyou2ROS1Interface:
     """Thread-safe ROS1 interface for Yuanyou2 dual-arm robot."""
 
-    def __init__(self, node_name: str = "yuanyou2_openpi_interface"):
+    def __init__(
+        self,
+        node_name: str = "yuanyou2_openpi_interface",
+        image_topics: dict[str, str] | None = None,
+    ):
         if not rospy.core.is_initialized():
             rospy.init_node(node_name, anonymous=True)
 
@@ -38,12 +44,34 @@ class Yuanyou2ROS1Interface:
         self.image_timestamps: Dict[str, float] = {}
         self.joint_timestamp: Optional[float] = None
 
-        # Camera topics: modify only if your real topic names change.
-        self.image_topics = {
+        self._warn_if_system_time_unset()
+
+        default_image_topics = {
             "head": "/head_camera/usb_cam/image_raw",
             "left_wrist": "/left_wrist_d435/color/image_raw",
             "right_wrist": "/right_wrist_d435/color/image_raw",
         }
+        configured_image_topics = dict(default_image_topics)
+        if image_topics:
+            configured_image_topics.update(image_topics)
+
+        self.image_topics = {
+            "head": rospy.get_param("~head_image_topic", configured_image_topics["head"]),
+            "left_wrist": rospy.get_param("~left_wrist_image_topic", configured_image_topics["left_wrist"]),
+            "right_wrist": rospy.get_param("~right_wrist_image_topic", configured_image_topics["right_wrist"]),
+        }
+        self.joint_state_topic = rospy.get_param("~joint_state_topic", "/joint_states")
+        self.left_cmd_topic = rospy.get_param("~left_cmd_topic", "/left/joint_cmd")
+        self.right_cmd_topic = rospy.get_param("~right_cmd_topic", "/right/joint_cmd")
+
+        self.use_gripper = bool(rospy.get_param("~use_gripper", True))
+        self.clamp_gripper = bool(rospy.get_param("~clamp_gripper", True))
+        self.gripper_min = float(rospy.get_param("~gripper_min", 0.0))
+        self.gripper_max = float(rospy.get_param("~gripper_max", 0.035))
+        self.arm_velocity_default = float(rospy.get_param("~arm_velocity_default", 0.0))
+        self.arm_effort_default = float(rospy.get_param("~arm_effort_default", 0.0))
+        self.gripper_velocity_default = float(rospy.get_param("~gripper_velocity_default", 10.0))
+        self.gripper_effort_default = float(rospy.get_param("~gripper_effort_default", 0.5))
 
         # Yuanyou2 14-dim layout:
         # [left_arm_6, left_gripper, right_arm_6, right_gripper]
@@ -65,7 +93,7 @@ class Yuanyou2ROS1Interface:
             "right_joint6",
         ]
 
-        # You need to confirm whether joint7 or joint8 is the better gripper state.
+        # The URDF exposes joint8 as the coupled opposite finger; command joint7 only.
         self.left_gripper_joint = "left_joint7"
         self.right_gripper_joint = "right_joint7"
 
@@ -73,31 +101,28 @@ class Yuanyou2ROS1Interface:
         self._setup_publishers()
 
         self.logger.info("Yuanyou2ROS1Interface initialized.")
+        self.logger.info("image_topics=%s", self.image_topics)
+        self.logger.info("joint_state_topic=%s", self.joint_state_topic)
+        self.logger.info("left_cmd_topic=%s right_cmd_topic=%s", self.left_cmd_topic, self.right_cmd_topic)
+
+    def _warn_if_system_time_unset(self):
+        # Jan 1 2020. A Jetson stuck near 1970 makes bag filenames and debugging painful.
+        if time.time() < 1577836800:
+            self.logger.warning(
+                "System clock appears unset. Fix NTP/date before collecting serious rosbag data."
+            )
 
     def _setup_subscribers(self):
-        rospy.Subscriber(
-            self.image_topics["head"],
-            Image,
-            lambda msg: self._image_callback(msg, "head"),
-            queue_size=1,
-        )
+        for camera_name, topic in self.image_topics.items():
+            rospy.Subscriber(
+                topic,
+                Image,
+                lambda msg, name=camera_name: self._image_callback(msg, name),
+                queue_size=1,
+            )
 
         rospy.Subscriber(
-            self.image_topics["left_wrist"],
-            Image,
-            lambda msg: self._image_callback(msg, "left_wrist"),
-            queue_size=1,
-        )
-
-        rospy.Subscriber(
-            self.image_topics["right_wrist"],
-            Image,
-            lambda msg: self._image_callback(msg, "right_wrist"),
-            queue_size=1,
-        )
-
-        rospy.Subscriber(
-            "/joint_states",
+            self.joint_state_topic,
             JointState,
             self._joint_state_callback,
             queue_size=1,
@@ -106,17 +131,14 @@ class Yuanyou2ROS1Interface:
         self.logger.info("ROS1 subscribers initialized.")
 
     def _setup_publishers(self):
-        # Confirm actual message type with:
-        # rostopic type /left/joint_cmd
-        # rostopic type /right/joint_cmd
         self.left_cmd_pub = rospy.Publisher(
-            "/left/joint_cmd",
+            self.left_cmd_topic,
             JointState,
             queue_size=1,
         )
 
         self.right_cmd_pub = rospy.Publisher(
-            "/right/joint_cmd",
+            self.right_cmd_topic,
             JointState,
             queue_size=1,
         )
@@ -163,7 +185,20 @@ class Yuanyou2ROS1Interface:
             f"Timeout waiting for sensor data. "
             f"missing_images={missing_images}, joints_ready={joints_ready}"
         )
+        self._log_published_topic_hint()
         return False
+
+    def _log_published_topic_hint(self):
+        try:
+            published_topics = {name for name, _type in rospy.get_published_topics()}
+        except Exception as exc:
+            self.logger.warning("Could not query published topics: %s", exc)
+            return
+
+        expected_topics = [self.joint_state_topic, *self.image_topics.values()]
+        missing_topics = [topic for topic in expected_topics if topic not in published_topics]
+        if missing_topics:
+            self.logger.error("Expected topics not currently published: %s", missing_topics)
 
     def get_observation(self) -> Optional[Dict]:
         with self.lock:
@@ -244,28 +279,51 @@ class Yuanyou2ROS1Interface:
 
         now = rospy.Time.now()
 
-        left_msg = JointState()
-        left_msg.header.stamp = now
-        left_msg.name = self.left_arm_joints
-        left_msg.position = left_arm_cmd.tolist()
-        left_msg.velocity = [0.0] * 6
-        left_msg.effort = [0.0] * 6
+        if self.clamp_gripper:
+            left_gripper_cmd = float(np.clip(left_gripper_cmd, self.gripper_min, self.gripper_max))
+            right_gripper_cmd = float(np.clip(right_gripper_cmd, self.gripper_min, self.gripper_max))
 
-        right_msg = JointState()
-        right_msg.header.stamp = now
-        right_msg.name = self.right_arm_joints
-        right_msg.position = right_arm_cmd.tolist()
-        right_msg.velocity = [0.0] * 6
-        right_msg.effort = [0.0] * 6
+        left_msg = self._build_cmd_msg(
+            now,
+            self.left_arm_joints,
+            self.left_gripper_joint,
+            left_arm_cmd,
+            left_gripper_cmd,
+        )
+        right_msg = self._build_cmd_msg(
+            now,
+            self.right_arm_joints,
+            self.right_gripper_joint,
+            right_arm_cmd,
+            right_gripper_cmd,
+        )
 
         self.left_cmd_pub.publish(left_msg)
         self.right_cmd_pub.publish(right_msg)
 
-        # Gripper handling:
-        # If your Piper gripper is controlled through joint_cmd joint7/joint8,
-        # you should integrate gripper command into the correct topic/message.
-        # Do not ignore this in final deployment.
         self.logger.debug(
-            f"Gripper commands not yet published separately: "
-            f"left={left_gripper_cmd}, right={right_gripper_cmd}"
+            f"Published Yuanyou2 action: left_gripper={left_gripper_cmd}, right_gripper={right_gripper_cmd}"
         )
+
+    def _build_cmd_msg(
+        self,
+        stamp: rospy.Time,
+        arm_joints: list[str],
+        gripper_joint: str,
+        arm_positions: np.ndarray,
+        gripper_position: float,
+    ) -> JointState:
+        msg = JointState()
+        msg.header.stamp = stamp
+        msg.name = list(arm_joints)
+        msg.position = list(np.asarray(arm_positions, dtype=np.float32))
+        msg.velocity = [self.arm_velocity_default] * len(arm_joints)
+        msg.effort = [self.arm_effort_default] * len(arm_joints)
+
+        if self.use_gripper:
+            msg.name.append(gripper_joint)
+            msg.position.append(float(gripper_position))
+            msg.velocity.append(self.gripper_velocity_default)
+            msg.effort.append(self.gripper_effort_default)
+
+        return msg

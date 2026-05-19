@@ -4,15 +4,19 @@ Environment wrapper for Yuanyou2 robot using openpi_client.runtime framework.
 ROS1 version.
 """
 
+from __future__ import annotations
+
 import logging
-from typing import Optional
 
 import numpy as np
 from openpi_client import image_tools
 from openpi_client.runtime import environment as _environment
 from typing_extensions import override
 
-from examples.yuanyou2 import ros1_interface
+try:
+    from examples.yuanyou2 import interface
+except ImportError:
+    import interface
 
 
 class Yuanyou2Environment(_environment.Environment):
@@ -21,22 +25,24 @@ class Yuanyou2Environment(_environment.Environment):
     def __init__(
         self,
         prompt: str = "pick a cube and place it on another cube",
+        sensor_timeout: float = 30.0,
+        image_topics: dict[str, str] | None = None,
     ):
         self._prompt = prompt
 
-        self._ros_interface: Optional[ros1_interface.Yuanyou2ROS1Interface] = (
-            ros1_interface.Yuanyou2ROS1Interface()
+        self._ros_interface: interface.Yuanyou2ROS1Interface | None = interface.Yuanyou2ROS1Interface(
+            image_topics=image_topics,
         )
 
-        if not self._ros_interface.wait_for_initial_data(timeout=30.0):
+        if not self._ros_interface.wait_for_initial_data(timeout=sensor_timeout):
             raise RuntimeError(
                 "Failed to receive initial sensor data. "
                 "Please check ROS1 topics:\n"
                 "  rostopic list\n"
                 "  rostopic hz /joint_states\n"
-                "  rostopic hz /head_camera/usb_cam/image_raw\n"
-                "  rostopic hz /left_wrist_d435/color/image_raw\n"
-                "  rostopic hz /right_wrist_d435/color/image_raw"
+                f"  rostopic hz {self._ros_interface.image_topics['head']}\n"
+                f"  rostopic hz {self._ros_interface.image_topics['left_wrist']}\n"
+                f"  rostopic hz {self._ros_interface.image_topics['right_wrist']}"
             )
 
         logging.info(f"Yuanyou2Environment initialized with prompt: '{prompt}'")

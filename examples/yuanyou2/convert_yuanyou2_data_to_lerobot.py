@@ -5,11 +5,6 @@ from bisect import bisect_left
 
 import cv2
 import numpy as np
-import rosbag
-from cv_bridge import CvBridge
-
-from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME
-from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 
 
 IMAGE_TOPICS = {
@@ -19,9 +14,12 @@ IMAGE_TOPICS = {
 }
 
 JOINT_STATE_TOPIC = "/joint_states"
+CMD_TOPICS = {
+    "left": "/left/joint_cmd",
+    "right": "/right/joint_cmd",
+}
 
-# 先按你的 14 维 Yuanyou2 结构定义。
-# gripper 到底用 joint7 还是 joint8，需要你最终实机确认。
+# 14D Yuanyou2 layout. joint8 is the coupled opposite finger in the URDF.
 LEFT_ARM_JOINTS = [
     "left_joint1",
     "left_joint2",
@@ -43,6 +41,13 @@ RIGHT_ARM_JOINTS = [
 LEFT_GRIPPER_JOINT = "left_joint7"
 RIGHT_GRIPPER_JOINT = "right_joint7"
 
+YUANYOU2_MOTOR_NAMES = (
+    LEFT_ARM_JOINTS
+    + ["left_gripper"]
+    + RIGHT_ARM_JOINTS
+    + ["right_gripper"]
+)
+
 
 def get_stamp_sec(msg, fallback_time):
     if hasattr(msg, "header") and msg.header.stamp:
@@ -55,7 +60,7 @@ def resize_rgb(image, size=(224, 224)):
     return image.astype(np.uint8)
 
 
-def nearest_item(items, target_time):
+def nearest_timed_item(items, target_time, max_delta=None):
     """
     items: list of (timestamp, data), sorted by timestamp
     """
@@ -66,16 +71,26 @@ def nearest_item(items, target_time):
     idx = bisect_left(times, target_time)
 
     if idx <= 0:
-        return items[0][1]
+        candidate = items[0]
+        return candidate if max_delta is None or abs(candidate[0] - target_time) <= max_delta else None
     if idx >= len(items):
-        return items[-1][1]
+        candidate = items[-1]
+        return candidate if max_delta is None or abs(candidate[0] - target_time) <= max_delta else None
 
     before = items[idx - 1]
     after = items[idx]
 
     if abs(before[0] - target_time) <= abs(after[0] - target_time):
-        return before[1]
-    return after[1]
+        candidate = before
+    else:
+        candidate = after
+
+    return candidate if max_delta is None or abs(candidate[0] - target_time) <= max_delta else None
+
+
+def nearest_item(items, target_time, max_delta=None):
+    item = nearest_timed_item(items, target_time, max_delta=max_delta)
+    return None if item is None else item[1]
 
 
 def extract_joint_position(msg, joint_name):
@@ -108,7 +123,47 @@ def extract_state_14d(joint_msg):
     return state
 
 
-def read_ros1_bag(bag_path):
+def extract_command_7d(msg, arm_joints, gripper_joint, fallback_gripper):
+    if msg is None:
+        return None
+
+    if len(msg.name) == len(msg.position) and msg.name:
+        name_to_pos = {name: float(position) for name, position in zip(msg.name, msg.position)}
+        if all(name in name_to_pos for name in arm_joints):
+            arm = [name_to_pos[name] for name in arm_joints]
+            gripper = name_to_pos.get(gripper_joint, fallback_gripper)
+            return np.asarray(arm + [float(gripper)], dtype=np.float32)
+
+    if len(msg.position) >= 6:
+        arm = [float(position) for position in msg.position[:6]]
+        gripper = float(msg.position[6]) if len(msg.position) >= 7 else fallback_gripper
+        return np.asarray(arm + [float(gripper)], dtype=np.float32)
+
+    return None
+
+
+def extract_action_14d_from_commands(left_cmd_msg, right_cmd_msg, fallback_state_14d):
+    left = extract_command_7d(
+        left_cmd_msg,
+        LEFT_ARM_JOINTS,
+        LEFT_GRIPPER_JOINT,
+        fallback_gripper=float(fallback_state_14d[6]),
+    )
+    right = extract_command_7d(
+        right_cmd_msg,
+        RIGHT_ARM_JOINTS,
+        RIGHT_GRIPPER_JOINT,
+        fallback_gripper=float(fallback_state_14d[13]),
+    )
+    if left is None or right is None:
+        return None
+    return np.concatenate([left, right]).astype(np.float32)
+
+
+def read_ros1_bag(bag_path, image_topics, joint_state_topic, cmd_topics):
+    import rosbag
+    from cv_bridge import CvBridge
+
     bridge = CvBridge()
 
     image_buffers = {
@@ -117,19 +172,27 @@ def read_ros1_bag(bag_path):
         "right_wrist": [],
     }
     joint_states = []
+    command_buffers = {
+        "left": [],
+        "right": [],
+    }
 
-    topics = list(IMAGE_TOPICS.values()) + [JOINT_STATE_TOPIC]
+    topics = list(image_topics.values()) + [joint_state_topic] + list(cmd_topics.values())
 
     with rosbag.Bag(bag_path, "r") as bag:
         for topic, msg, t in bag.read_messages(topics=topics):
             timestamp = get_stamp_sec(msg, t)
 
-            if topic == JOINT_STATE_TOPIC:
+            if topic == joint_state_topic:
                 joint_states.append((timestamp, msg))
+            elif topic == cmd_topics["left"]:
+                command_buffers["left"].append((timestamp, msg))
+            elif topic == cmd_topics["right"]:
+                command_buffers["right"].append((timestamp, msg))
 
-            elif topic in IMAGE_TOPICS.values():
+            elif topic in image_topics.values():
                 camera_key = None
-                for key, ros_topic in IMAGE_TOPICS.items():
+                for key, ros_topic in image_topics.items():
                     if topic == ros_topic:
                         camera_key = key
                         break
@@ -149,11 +212,16 @@ def read_ros1_bag(bag_path):
         image_buffers[key].sort(key=lambda x: x[0])
 
     joint_states.sort(key=lambda x: x[0])
+    for key in command_buffers:
+        command_buffers[key].sort(key=lambda x: x[0])
 
-    return image_buffers, joint_states
+    return image_buffers, joint_states, command_buffers
 
 
 def create_lerobot_dataset(repo_id, fps):
+    from lerobot.common.datasets.lerobot_dataset import HF_LEROBOT_HOME
+    from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+
     output_path = HF_LEROBOT_HOME / repo_id
     if output_path.exists():
         shutil.rmtree(output_path)
@@ -181,12 +249,12 @@ def create_lerobot_dataset(repo_id, fps):
             "observation.state": {
                 "dtype": "float32",
                 "shape": (14,),
-                "names": ["state"],
+                "names": [YUANYOU2_MOTOR_NAMES],
             },
             "action": {
                 "dtype": "float32",
                 "shape": (14,),
-                "names": ["action"],
+                "names": [YUANYOU2_MOTOR_NAMES],
             },
         },
         image_writer_threads=10,
@@ -196,17 +264,35 @@ def create_lerobot_dataset(repo_id, fps):
     return dataset
 
 
-def convert_bag_to_episode(dataset, bag_path, fps, task):
-    image_buffers, joint_states = read_ros1_bag(bag_path)
+def convert_bag_to_episode(
+    dataset,
+    bag_path,
+    fps,
+    task,
+    image_topics,
+    joint_state_topic,
+    cmd_topics,
+    action_source,
+    max_command_age_sec,
+):
+    image_buffers, joint_states, command_buffers = read_ros1_bag(
+        bag_path,
+        image_topics=image_topics,
+        joint_state_topic=joint_state_topic,
+        cmd_topics=cmd_topics,
+    )
 
     if not joint_states:
-        raise RuntimeError(f"No /joint_states found in {bag_path}")
+        raise RuntimeError(f"No {joint_state_topic} found in {bag_path}")
 
     start_time = joint_states[0][0]
     end_time = joint_states[-1][0]
     dt = 1.0 / fps
 
     current_time = start_time
+    added_frames = 0
+    command_action_frames = 0
+    next_state_action_frames = 0
 
     while current_time < end_time - dt:
         joint_msg = nearest_item(joint_states, current_time)
@@ -225,10 +311,21 @@ def convert_bag_to_episode(dataset, bag_path, fps, task):
             continue
 
         state_14d = extract_state_14d(joint_msg)
+        action_14d = None
 
-        # 第一版先用下一帧状态作为 action。
-        # 后面如果你录到了真实 command topic，可以改成 command_14d。
-        action_14d = extract_state_14d(next_joint_msg)
+        if action_source in ("command", "command_or_next_state"):
+            left_cmd = nearest_item(command_buffers["left"], current_time, max_delta=max_command_age_sec)
+            right_cmd = nearest_item(command_buffers["right"], current_time, max_delta=max_command_age_sec)
+            action_14d = extract_action_14d_from_commands(left_cmd, right_cmd, state_14d)
+            if action_14d is not None:
+                command_action_frames += 1
+
+        if action_14d is None:
+            if action_source == "command":
+                current_time += dt
+                continue
+            action_14d = extract_state_14d(next_joint_msg)
+            next_state_action_frames += 1
 
         dataset.add_frame(
             {
@@ -241,9 +338,14 @@ def convert_bag_to_episode(dataset, bag_path, fps, task):
             }
         )
 
+        added_frames += 1
         current_time += dt
 
     dataset.save_episode()
+    print(
+        f"{bag_path}: saved {added_frames} frames "
+        f"(command_actions={command_action_frames}, next_state_actions={next_state_action_frames})"
+    )
 
 
 def main():
@@ -252,6 +354,19 @@ def main():
     parser.add_argument("--output", "-o", type=str, default="eeason396/yuanyou2_test")
     parser.add_argument("--fps", type=int, default=10)
     parser.add_argument("--task", type=str, default="pick a cube and place it on another cube")
+    parser.add_argument(
+        "--action-source",
+        choices=("command_or_next_state", "command", "next_state"),
+        default="command_or_next_state",
+        help="Use recorded /left|right/joint_cmd actions when available, otherwise fall back to next-state actions.",
+    )
+    parser.add_argument("--max-command-age-sec", type=float, default=0.25)
+    parser.add_argument("--head-image-topic", default=IMAGE_TOPICS["head"])
+    parser.add_argument("--left-wrist-image-topic", default=IMAGE_TOPICS["left_wrist"])
+    parser.add_argument("--right-wrist-image-topic", default=IMAGE_TOPICS["right_wrist"])
+    parser.add_argument("--joint-state-topic", default=JOINT_STATE_TOPIC)
+    parser.add_argument("--left-cmd-topic", default=CMD_TOPICS["left"])
+    parser.add_argument("--right-cmd-topic", default=CMD_TOPICS["right"])
     args = parser.parse_args()
 
     bag_dir = Path(args.bag_dir)
@@ -261,10 +376,29 @@ def main():
         raise RuntimeError(f"No .bag files found in {bag_dir}")
 
     dataset = create_lerobot_dataset(args.output, args.fps)
+    image_topics = {
+        "head": args.head_image_topic,
+        "left_wrist": args.left_wrist_image_topic,
+        "right_wrist": args.right_wrist_image_topic,
+    }
+    cmd_topics = {
+        "left": args.left_cmd_topic,
+        "right": args.right_cmd_topic,
+    }
 
     for bag_path in bag_files:
         print(f"Converting {bag_path}")
-        convert_bag_to_episode(dataset, str(bag_path), args.fps, args.task)
+        convert_bag_to_episode(
+            dataset,
+            str(bag_path),
+            args.fps,
+            args.task,
+            image_topics=image_topics,
+            joint_state_topic=args.joint_state_topic,
+            cmd_topics=cmd_topics,
+            action_source=args.action_source,
+            max_command_age_sec=args.max_command_age_sec,
+        )
 
     print(f"Done. Dataset saved to {args.output}")
 

@@ -832,6 +832,80 @@ _CONFIGS = [
         pytorch_weight_path="/path/to/your/pytorch_weight_path",
         num_train_steps=30_000,
     ),
+    TrainConfig(
+        name="pi05_yuanyou2_full_finetune",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_horizon=30,
+            discrete_state_input=False,
+            # Keep 32 to match pi05_base pretrained action head.
+            # Yuanyou2Outputs will slice model output to the first 14 dims.
+            action_dim=32,
+        ),
+        data=LeRobotYuanyou2DataConfig(
+            repo_id="your_username/yuanyou2_dataset",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            # First stage: use absolute joint actions.
+            # action = [left_arm_6, left_gripper, right_arm_6, right_gripper]
+            use_delta_joint_actions=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        batch_size=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=2_000,
+            peak_lr=5e-5,
+            decay_steps=30_000,
+            decay_lr=5e-6,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_yuanyou2_lora_finetune",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            action_horizon=30,
+            discrete_state_input=False,
+            # Keep 32 to match pi05_base pretrained weights.
+            # Yuanyou2 policy only uses the first 14 dims.
+            action_dim=32,
+        ),
+        data=LeRobotYuanyou2DataConfig(
+            repo_id="your_username/yuanyou2_dataset",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            use_delta_joint_actions=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        batch_size=16,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=1e-4,
+            decay_steps=20_000,
+            decay_lr=1e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        num_train_steps=20_000,
+        # Freeze non-LoRA parameters.
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            action_horizon=30,
+            discrete_state_input=False,
+            action_dim=32,
+        ).get_freeze_filter(),
+        # LoRA generally disables EMA.
+        ema_decay=None,
+    ),
     #
     # Fine-tuning Aloha configs.
     #

@@ -21,7 +21,10 @@ from openpi_client.runtime import runtime as _runtime
 from openpi_client.runtime.agents import policy_agent as _policy_agent
 import tyro
 
-from examples.yuanyou2 import yuanyou2_environment as _env
+try:
+    from examples.yuanyou2 import env as _env
+except ImportError:
+    import env as _env
 
 
 @dataclasses.dataclass
@@ -52,6 +55,18 @@ class Args:
     max_episode_steps: int = 250
     """Maximum steps per episode."""
 
+    sensor_timeout: float = 30.0
+    """Seconds to wait for the first complete ROS observation."""
+
+    head_image_topic: str = "/head_camera/usb_cam/image_raw"
+    """ROS image topic for the head Orbbec DCW camera."""
+
+    left_wrist_image_topic: str = "/left_wrist_d435/color/image_raw"
+    """ROS image topic for the left wrist D435/D434 camera."""
+
+    right_wrist_image_topic: str = "/right_wrist_d435/color/image_raw"
+    """ROS image topic for the right wrist D435/D434 camera."""
+
 
 def main(args: Args) -> None:
     logging.info("=" * 60)
@@ -80,6 +95,12 @@ def main(args: Args) -> None:
 
     environment = _env.Yuanyou2Environment(
         prompt=args.prompt,
+        sensor_timeout=args.sensor_timeout,
+        image_topics={
+            "head": args.head_image_topic,
+            "left_wrist": args.left_wrist_image_topic,
+            "right_wrist": args.right_wrist_image_topic,
+        },
     )
 
     agent = _policy_agent.PolicyAgent(

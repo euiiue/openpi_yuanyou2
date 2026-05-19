@@ -116,6 +116,8 @@ class Yuanyou2Inputs(transforms.DataTransformFn):
         # Keep this for your own dataset (but modify the key if the instruction is not
         # stored in "prompt"; the output dict always needs to have the key "prompt").
         if "prompt" in data:
+            if isinstance(data["prompt"], bytes):
+                data["prompt"] = data["prompt"].decode("utf-8")
             inputs["prompt"] = data["prompt"]
 
         return inputs
